@@ -9,6 +9,21 @@ import { TokenDeployForm } from "./components/TokenDeployForm";
 import { useWallet } from "./hooks/useWallet";
 import { truncateAddress } from "./utils/formatting";
 
+const HomeRoute = lazy(() => import("./routes/HomeRoute"));
+const NotFoundRoute = lazy(() => import("./routes/NotFoundRoute"));
+
+function usePathname() {
+  const [pathname, setPathname] = useState(() => window.location.pathname);
+
+  useEffect(() => {
+    const onPopState = () => setPathname(window.location.pathname);
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  return pathname;
+}
+
 function App() {
   const { wallet, connect, disconnect, isConnecting, error } = useWallet();
 
