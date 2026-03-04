@@ -70,6 +70,9 @@ pub fn get_token_info(env: &Env, index: u32) -> Option<TokenInfo> {
 pub fn set_token_info(env: &Env, index: u32, info: &TokenInfo) {
     env.storage().instance().set(&DataKey::Token(index), info);
     
+    // Index by creator for pagination
+    add_creator_token(env, &info.creator, index);
+    
     // Emit token registered event
     crate::events::emit_token_registered(env, &info.address, &info.creator);
 }
@@ -659,4 +662,143 @@ pub fn get_admin_state(env: &Env) -> (Address, bool) {
     let admin = get_admin(env);
     let paused = is_paused(env);
     (admin, paused)
+}
+
+
+// ── Timelock storage functions ─────────────────────────────
+
+pub fn get_timelock_config(env: &Env) -> crate::types::TimelockConfig {
+    env.storage()
+        .instance()
+        .get(&DataKey::TimelockConfig)
+        .unwrap_or(crate::types::TimelockConfig {
+            delay_seconds: 172_800, // 48 hours default
+            enabled: false,
+        })
+}
+
+pub fn set_timelock_config(env: &Env, config: &crate::types::TimelockConfig) {
+    env.storage().instance().set(&DataKey::TimelockConfig, config);
+}
+
+pub fn get_next_change_id(env: &Env) -> u64 {
+    let id = env.storage()
+        .instance()
+        .get(&DataKey::NextChangeId)
+        .unwrap_or(0_u64);
+    env.storage().instance().set(&DataKey::NextChangeId, &(id + 1));
+    id
+}
+
+pub fn get_pending_change(env: &Env, change_id: u64) -> Option<crate::types::PendingChange> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PendingChange(change_id))
+}
+
+pub fn set_pending_change(env: &Env, change_id: u64, change: &crate::types::PendingChange) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::PendingChange(change_id), change);
+}
+
+pub fn remove_pending_change(env: &Env, change_id: u64) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingChange(change_id));
+}
+
+
+// ── Creator indexing functions ─────────────────────────────
+
+/// Add a token index to a creator's token list
+pub fn add_creator_token(env: &Env, creator: &Address, token_index: u32) {
+    let mut tokens: soroban_sdk::Vec<u32> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::CreatorTokens(creator.clone()))
+        .unwrap_or(soroban_sdk::Vec::new(env));
+    
+    tokens.push_back(token_index);
+    
+    env.storage()
+        .persistent()
+        .set(&DataKey::CreatorTokens(creator.clone()), &tokens);
+    
+    // Update count
+    let count = tokens.len();
+    env.storage()
+        .persistent()
+        .set(&DataKey::CreatorTokenCount(creator.clone()), &count);
+}
+
+/// Get all token indices for a creator
+pub fn get_creator_tokens(env: &Env, creator: &Address) -> soroban_sdk::Vec<u32> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CreatorTokens(creator.clone()))
+        .unwrap_or(soroban_sdk::Vec::new(env))
+}
+
+/// Get the number of tokens created by an address
+pub fn get_creator_token_count(env: &Env, creator: &Address) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CreatorTokenCount(creator.clone()))
+        .unwrap_or(0)
+}
+
+
+// ── Treasury storage functions ─────────────────────────────
+
+/// Get treasury withdrawal policy
+pub fn get_treasury_policy(env: &Env) -> crate::types::TreasuryPolicy {
+    env.storage()
+        .instance()
+        .get(&DataKey::TreasuryPolicy)
+        .unwrap_or(crate::types::TreasuryPolicy {
+            daily_cap: 100_0000000, // 100 XLM default
+            allowlist_enabled: false,
+            period_duration: 86_400, // 24 hours
+        })
+}
+
+/// Set treasury withdrawal policy
+pub fn set_treasury_policy(env: &Env, policy: &crate::types::TreasuryPolicy) {
+    env.storage()
+        .instance()
+        .set(&DataKey::TreasuryPolicy, policy);
+}
+
+/// Get current withdrawal period
+pub fn get_withdrawal_period(env: &Env) -> crate::types::WithdrawalPeriod {
+    env.storage()
+        .instance()
+        .get(&DataKey::WithdrawalPeriod)
+        .unwrap_or(crate::types::WithdrawalPeriod {
+            period_start: env.ledger().timestamp(),
+            amount_withdrawn: 0,
+        })
+}
+
+/// Set withdrawal period
+pub fn set_withdrawal_period(env: &Env, period: &crate::types::WithdrawalPeriod) {
+    env.storage()
+        .instance()
+        .set(&DataKey::WithdrawalPeriod, period);
+}
+
+/// Check if address is allowed recipient
+pub fn is_allowed_recipient(env: &Env, recipient: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AllowedRecipient(recipient.clone()))
+        .unwrap_or(false)
+}
+
+/// Set allowed recipient status
+pub fn set_allowed_recipient(env: &Env, recipient: &Address, allowed: bool) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::AllowedRecipient(recipient.clone()), &allowed);
 }
