@@ -1,21 +1,16 @@
 #![no_std]
 
+mod freeze_functions;
+
 mod events;
+mod event_versions;
 mod storage;
 mod burn;
 mod types;
-mod validation;
-mod stream_types;
+mod token_creation;
 
-use soroban_sdk::{contract, contractimpl, Address, Env, String};
-use types::{ContractMetadata, Error, FactoryState, TokenInfo};
-
-// Contract metadata constants
-const CONTRACT_NAME: &str = "Nova Launch Token Factory";
-const CONTRACT_DESCRIPTION: &str = "No-code token deployment on Stellar";
-const CONTRACT_AUTHOR: &str = "Nova Launch Team";
-const CONTRACT_LICENSE: &str = "MIT";
-const CONTRACT_VERSION: &str = "1.0.0";
+use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
+use types::{Error, FactoryState, TokenInfo, TokenCreationParams};
 
 #[contract]
 pub struct TokenFactory;
@@ -512,6 +507,13 @@ impl TokenFactory {
         Ok(())
     }
 
+    /// Get token info by index
+    pub fn get_token_info(env: Env, index: u32) -> Result<TokenInfo, Error> {
+        let mut info = storage::get_token_info(&env, index).ok_or(Error::TokenNotFound)?;
+        info.is_paused = storage::is_token_paused(&env, index);
+        Ok(info)
+    }
+
     /// Batch update admin operations (Phase 2 optimization)
     ///
     /// Updates multiple admin parameters in a single transaction,
@@ -651,32 +653,217 @@ impl TokenFactory {
     /// assert_eq!(token.symbol, "MTK");
     /// assert_eq!(token.decimals, 7);
     /// ```
-    pub fn get_token_info(env: Env, index: u32) -> Result<TokenInfo, Error> {
-        storage::get_token_info(&env, index).ok_or(Error::TokenNotFound)
-    }
 
-    /// Get token information by contract address
+    /// Create a new vesting stream
     ///
-    /// Retrieves complete information about a token using its
-    /// deployed contract address.
+    /// Creates a token vesting stream with a defined schedule.
     ///
     /// # Arguments
     /// * `env` - The contract environment
-    /// * `token_address` - The token's contract address
+    /// * `creator` - Address creating the stream (must authorize)
+    /// * `recipient` - Address that will receive vested tokens
+    /// * `token_address` - Token contract address
+    /// * `amount` - Total amount to vest (must be > 0)
+    /// * `start_time` - Stream start timestamp
+    /// * `cliff_time` - Cliff timestamp (no claims before this)
+    /// * `end_time` - Stream end timestamp
+    /// * `metadata` - Optional metadata string
     ///
     /// # Returns
-    /// Returns `Ok(TokenInfo)` with token details
+    /// Returns the created stream ID
     ///
     /// # Errors
-    /// * `Error::TokenNotFound` - Token address not found in registry
+    /// * `Error::InvalidAmount` - Amount is zero or negative
+    /// * `Error::InvalidSchedule` - Schedule ordering invalid (start > cliff or cliff > end)
+    /// * `Error::InvalidParameters` - Metadata exceeds 512 characters
+    pub fn create_stream(
+        env: Env,
+        creator: Address,
+        recipient: Address,
+        token_address: Address,
+        amount: i128,
+        start_time: u64,
+        cliff_time: u64,
+        end_time: u64,
+        metadata: Option<String>,
+    ) -> Result<u32, Error> {
+        creator.require_auth();
+
+        // Validate amount
+        stream_types::validate_amount(amount)?;
+
+        // Validate schedule
+        let schedule = stream_types::StreamSchedule {
+            start_time,
+            cliff_time,
+            end_time,
+        };
+        stream_types::validate_schedule(&schedule)?;
+
+        // Validate metadata
+        stream_types::validate_metadata(&metadata)?;
+
+        // Generate stream ID
+        let stream_id = storage::increment_stream_count(&env);
+
+        // Create stream
+        let stream = stream_types::StreamInfo {
+            id: stream_id,
+            creator: creator.clone(),
+            recipient: recipient.clone(),
+            token_address: token_address.clone(),
+            amount,
+            schedule,
+            claimed: 0,
+            cancelled: false,
+            metadata: metadata.clone(),
+            created_at: env.ledger().timestamp(),
+        };
+
+        // Persist stream
+        storage::set_stream(&env, stream_id, &stream);
+        storage::add_creator_stream(&env, &creator, stream_id);
+
+        // Emit event
+        events::emit_stream_created(
+            &env,
+            stream_id,
+            &creator,
+            &recipient,
+            amount,
+            metadata.is_some(),
+        );
+
+        Ok(stream_id)
+    }
+
+    /// Get stream information by ID
     ///
-    /// # Examples
-    /// ```
-    /// let token = factory.get_token_info_by_address(&env, token_addr)?;
-    /// assert_eq!(token.creator, expected_creator);
-    /// ```
-    pub fn get_token_info_by_address(env: Env, token_address: Address) -> Result<TokenInfo, Error> {
-        storage::get_token_info_by_address(&env, &token_address).ok_or(Error::TokenNotFound)
+    /// Retrieves complete vesting stream details including schedule,
+    /// amounts, and metadata. This is a read-only operation.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `stream_id` - Unique stream identifier
+    ///
+    /// # Returns
+    /// Returns `StreamInfo` with all stream details
+    ///
+    /// # Errors
+    /// * `Error::StreamNotFound` - Stream ID does not exist
+    pub fn get_stream(env: Env, stream_id: u32) -> Result<stream_types::StreamInfo, Error> {
+        storage::get_stream(&env, stream_id).ok_or(Error::StreamNotFound)
+    }
+
+    /// Get total number of streams created
+    ///
+    /// # Returns
+    /// Total count of all streams
+    pub fn get_stream_count(env: Env) -> u32 {
+        storage::get_stream_count(&env)
+    }
+
+    /// Admin burn function with clawback capability (by address)
+    ///
+    /// Retrieves streams in pages with stable ordering by stream ID.
+    /// Maximum limit is 100 to prevent expensive reads.
+    ///
+    /// # Security Considerations
+    /// - Only token creator can perform admin burns
+    /// - Separate event type distinguishes admin burns from self burns
+    /// - Clawback must be explicitly enabled per token
+    /// - All burns are permanently recorded in total_burned counter
+    pub fn admin_burn_by_address(
+        env: Env,
+        cursor: u32,
+        limit: u32,
+    ) -> Result<Vec<stream_types::StreamInfo>, Error> {
+        const MAX_LIMIT: u32 = 100;
+
+        if limit == 0 || limit > MAX_LIMIT || cursor == 0 {
+            return Err(Error::InvalidParameters);
+        }
+
+        let total_count = storage::get_stream_count(&env);
+        let mut streams = Vec::new(&env);
+
+        let end = cursor.saturating_add(limit).min(total_count + 1);
+
+        for stream_id in cursor..end {
+            if let Some(stream) = storage::get_stream(&env, stream_id) {
+                streams.push_back(stream);
+            }
+        }
+
+        Ok(streams)
+    }
+
+    /// Claim vested tokens from a stream
+    ///
+    /// Allows the beneficiary to claim tokens that have vested up to the
+    /// current ledger time. Only the claimable delta (vested - claimed) is released.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `stream_id` - Stream identifier
+    /// * `recipient` - Beneficiary address (must authorize and match stream recipient)
+    ///
+    /// # Returns
+    /// Amount of tokens claimed
+    ///
+    /// # Errors
+    /// * `Error::StreamNotFound` - Stream ID does not exist
+    /// * `Error::Unauthorized` - Caller is not the stream recipient
+    /// * `Error::StreamCancelled` - Stream has been cancelled
+    /// * `Error::CliffNotReached` - Current time is before cliff time
+    /// * `Error::NothingToClaim` - No new tokens available to claim
+    pub fn claim_stream(
+        env: Env,
+        stream_id: u32,
+        recipient: Address,
+    ) -> Result<i128, Error> {
+        recipient.require_auth();
+
+        // Get stream
+        let mut stream = storage::get_stream(&env, stream_id).ok_or(Error::StreamNotFound)?;
+
+        // Verify recipient
+        if stream.recipient != recipient {
+            return Err(Error::Unauthorized);
+        }
+
+        // Check if cancelled
+        if stream.cancelled {
+            return Err(Error::StreamCancelled);
+        }
+
+        let current_time = env.ledger().timestamp();
+
+        // Check cliff
+        if current_time < stream.schedule.cliff_time {
+            return Err(Error::CliffNotReached);
+        }
+
+        // Calculate vested amount
+        let vested = stream_types::calculate_vested_amount(&stream, current_time);
+
+        // Calculate claimable delta
+        let claimable = vested.checked_sub(stream.claimed).unwrap_or(0);
+
+        if claimable <= 0 {
+            return Err(Error::NothingToClaim);
+        }
+
+        // Update claimed amount atomically
+        stream.claimed = stream.claimed.checked_add(claimable).unwrap_or(stream.amount);
+
+        // Persist updated stream
+        storage::set_stream(&env, stream_id, &stream);
+
+        // Emit event
+        events::emit_stream_claimed(&env, stream_id, &recipient, claimable);
+
+        Ok(claimable)
     }
 
     /// Toggle clawback capability for a token (creator only)
@@ -739,6 +926,7 @@ impl TokenFactory {
 
         Ok(())
     }
+
 
     /// Burn tokens from caller's own balance
     ///
@@ -961,6 +1149,832 @@ impl TokenFactory {
     }
 
 }
+    /// Create a single token with fee payment
+    /// 
+    /// # Arguments
+    /// * `creator` - Address creating the token (must authorize)
+    /// * `name` - Token name (1-32 characters)
+    /// * `symbol` - Token symbol (1-12 characters)
+    /// * `decimals` - Token decimals (0-18)
+    /// * `initial_supply` - Initial token supply (must be positive)
+    /// * `metadata_uri` - Optional metadata URI
+    /// * `fee_payment` - Fee payment amount
+    /// 
+    /// # Returns
+    /// Address of the created token
+    /// 
+    /// # Errors
+    /// * `ContractPaused` - Contract is paused
+    /// * `InsufficientFee` - Fee payment is insufficient
+    /// * `InvalidTokenParams` - Token parameters are invalid
+    pub fn create_token(
+        env: Env,
+        creator: Address,
+        name: String,
+        symbol: String,
+        decimals: u32,
+        initial_supply: i128,
+        metadata_uri: Option<String>,
+        fee_payment: i128,
+    ) -> Result<Address, Error> {
+        token_creation::create_token(
+            &env,
+            creator,
+            name,
+            symbol,
+            decimals,
+            initial_supply,
+            metadata_uri,
+            fee_payment,
+        )
+    }
+
+    /// Batch create multiple tokens atomically
+    /// 
+    /// All tokens are created in a single transaction with atomic semantics.
+    /// If any token fails validation, the entire batch is rolled back.
+    /// 
+    /// # Arguments
+    /// * `creator` - Address creating the tokens (must authorize)
+    /// * `tokens` - Vector of token creation parameters
+    /// * `total_fee_payment` - Total fee payment for all tokens
+    /// 
+    /// # Returns
+    /// Vector of created token addresses
+    /// 
+    /// # Errors
+    /// * `ContractPaused` - Contract is paused
+    /// * `InsufficientFee` - Total fee payment is insufficient
+    /// * `InvalidTokenParams` - Any token has invalid parameters
+    /// * `BatchCreationFailed` - Batch creation failed (atomic rollback)
+    pub fn batch_create_tokens(
+        env: Env,
+        creator: Address,
+        tokens: Vec<TokenCreationParams>,
+        total_fee_payment: i128,
+    ) -> Result<Vec<Address>, Error> {
+        token_creation::batch_create_tokens(&env, creator, tokens, total_fee_payment)
+    }
+
+}
+
+        // Require admin authorization
+        admin.require_auth();
+
+        // Get token info
+        let mut token_info = storage::get_token_info(&env, token_index)
+            .ok_or(Error::TokenNotFound)?;
+
+        // Verify admin is the token creator
+        if token_info.creator != admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Enforce immutability: metadata can only be set once
+        if token_info.metadata_uri.is_some() {
+            return Err(Error::MetadataAlreadySet);
+        }
+
+        // Set metadata URI
+        token_info.metadata_uri = Some(metadata_uri.clone());
+        storage::set_token_info(&env, token_index, &token_info);
+
+        // Also update by address lookup
+        storage::set_token_info_by_address(&env, &token_info.address, &token_info);
+
+        // Emit metadata set event
+        events::emit_metadata_set(&env, &token_info.address, &admin, &metadata_uri);
+
+        Ok(())
+    }
+
+    pub fn pause_token(env: Env, admin: Address, token_index: u32) -> Result<(), Error> {
+        admin.require_auth();
+        if admin != storage::get_admin(&env) {
+            return Err(Error::Unauthorized);
+        }
+        storage::get_token_info(&env, token_index).ok_or(Error::TokenNotFound)?;
+        storage::set_token_paused(&env, token_index, true);
+        Ok(())
+    }
+
+    pub fn unpause_token(env: Env, admin: Address, token_index: u32) -> Result<(), Error> {
+        admin.require_auth();
+        if admin != storage::get_admin(&env) {
+            return Err(Error::Unauthorized);
+        }
+        storage::get_token_info(&env, token_index).ok_or(Error::TokenNotFound)?;
+        storage::set_token_paused(&env, token_index, false);
+        Ok(())
+    }
+
+    pub fn is_token_paused(env: Env, token_index: u32) -> bool {
+        storage::is_token_paused(&env, token_index)
+    }
+
+    /// Return a compact stats snapshot for a token
+    pub fn get_token_stats(env: Env, token_index: u32) -> Result<TokenStats, Error> {
+        storage::get_token_info(&env, token_index).ok_or(Error::TokenNotFound)?;
+
+        Ok(TokenStats {
+            current_supply: storage::get_token_info(&env, token_index)
+                .map(|i| i.total_supply)
+                .unwrap_or(0),
+            total_burned:   storage::get_total_burned(&env, token_index),
+            burn_count:     storage::get_burn_count(&env, token_index),
+            is_paused:      storage::is_token_paused(&env, token_index),
+            has_clawback:   false,
+        })
+    }
+    // ═══════════════════════════════════════════════════════════════════════
+    // Timelock Functions
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Schedule a fee update with timelock
+    ///
+    /// Schedules a change to base_fee or metadata_fee that cannot be executed
+    /// until the timelock delay has passed. This provides transparency and
+    /// allows users to react to upcoming changes.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `admin` - Admin address (must authorize and match stored admin)
+    /// * `base_fee` - Optional new base fee in stroops (None = no change)
+    /// * `metadata_fee` - Optional new metadata fee in stroops (None = no change)
+    ///
+    /// # Returns
+    /// Returns the change ID that can be used to execute or cancel the change
+    ///
+    /// # Errors
+    /// * `Error::Unauthorized` - Caller is not the admin
+    /// * `Error::InvalidParameters` - Both fees are None or any fee is negative
+    ///
+    /// # Examples
+    /// ```
+    /// // Schedule fee update
+    /// let change_id = factory.schedule_fee_update(&env, admin, Some(2_000_000), None)?;
+    /// // Wait for timelock to expire, then execute
+    /// factory.execute_change(&env, change_id)?;
+    /// ```
+    pub fn schedule_fee_update(
+        env: Env,
+        admin: Address,
+        base_fee: Option<i128>,
+        metadata_fee: Option<i128>,
+    ) -> Result<u64, Error> {
+        timelock::schedule_fee_update(&env, &admin, base_fee, metadata_fee)
+    }
+
+    /// Schedule a pause state change with timelock
+    ///
+    /// Schedules a change to the contract's pause state that cannot be executed
+    /// until the timelock delay has passed.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `admin` - Admin address (must authorize and match stored admin)
+    /// * `paused` - New pause state (true to pause, false to unpause)
+    ///
+    /// # Returns
+    /// Returns the change ID
+    ///
+    /// # Errors
+    /// * `Error::Unauthorized` - Caller is not the admin
+    ///
+    /// # Examples
+    /// ```
+    /// let change_id = factory.schedule_pause_update(&env, admin, true)?;
+    /// ```
+    pub fn schedule_pause_update(
+        env: Env,
+        admin: Address,
+        paused: bool,
+    ) -> Result<u64, Error> {
+        timelock::schedule_pause_update(&env, &admin, paused)
+    }
+
+    /// Schedule a treasury address change with timelock
+    ///
+    /// Schedules a change to the treasury address that cannot be executed
+    /// until the timelock delay has passed.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `admin` - Admin address (must authorize and match stored admin)
+    /// * `new_treasury` - New treasury address
+    ///
+    /// # Returns
+    /// Returns the change ID
+    ///
+    /// # Errors
+    /// * `Error::Unauthorized` - Caller is not the admin
+    ///
+    /// # Examples
+    /// ```
+    /// let change_id = factory.schedule_treasury_update(&env, admin, new_treasury)?;
+    /// ```
+    pub fn schedule_treasury_update(
+        env: Env,
+        admin: Address,
+        new_treasury: Address,
+    ) -> Result<u64, Error> {
+        timelock::schedule_treasury_update(&env, &admin, &new_treasury)
+    }
+
+    /// Execute a pending change
+    ///
+    /// Executes a previously scheduled change after the timelock has expired.
+    /// Anyone can call this function once the timelock period has elapsed.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `change_id` - ID of the pending change to execute
+    ///
+    /// # Returns
+    /// Returns `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `Error::TokenNotFound` - Change ID not found
+    /// * `Error::TimelockNotExpired` - Timelock period has not elapsed
+    /// * `Error::ChangeAlreadyExecuted` - Change has already been executed
+    ///
+    /// # Examples
+    /// ```
+    /// // After timelock expires
+    /// factory.execute_change(&env, change_id)?;
+    /// ```
+    pub fn execute_change(env: Env, change_id: u64) -> Result<(), Error> {
+        timelock::execute_change(&env, change_id)
+    }
+
+    /// Cancel a pending change
+    ///
+    /// Cancels a scheduled change before it is executed.
+    /// Only the admin can cancel pending changes.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `admin` - Admin address (must authorize and match stored admin)
+    /// * `change_id` - ID of the pending change to cancel
+    ///
+    /// # Returns
+    /// Returns `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `Error::Unauthorized` - Caller is not the admin
+    /// * `Error::TokenNotFound` - Change ID not found
+    /// * `Error::ChangeAlreadyExecuted` - Change has already been executed
+    ///
+    /// # Examples
+    /// ```
+    /// factory.cancel_change(&env, admin, change_id)?;
+    /// ```
+    pub fn cancel_change(env: Env, admin: Address, change_id: u64) -> Result<(), Error> {
+        timelock::cancel_change(&env, &admin, change_id)
+    }
+
+    /// Get pending change details
+    ///
+    /// Retrieves information about a scheduled change including when it
+    /// can be executed and what parameters will be changed.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `change_id` - ID of the pending change
+    ///
+    /// # Returns
+    /// Returns the PendingChange if found, None otherwise
+    ///
+    /// # Examples
+    /// ```
+    /// if let Some(change) = factory.get_pending_change(&env, change_id) {
+    ///     log!("Change can be executed at: {}", change.execute_at);
+    /// }
+    /// ```
+    pub fn get_pending_change(env: Env, change_id: u64) -> Option<types::PendingChange> {
+        timelock::get_pending_change(&env, change_id)
+    }
+
+    /// Get timelock configuration
+    ///
+    /// Returns the current timelock settings including the delay period.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    ///
+    /// # Returns
+    /// Returns the TimelockConfig
+    ///
+    /// # Examples
+    /// ```
+    /// let config = factory.get_timelock_config(&env);
+    /// log!("Timelock delay: {} seconds", config.delay_seconds);
+    /// ```
+    pub fn get_timelock_config(env: Env) -> types::TimelockConfig {
+        timelock::get_timelock_config(&env)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Pagination Functions
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Get tokens created by a specific address with pagination
+    ///
+    /// Returns a paginated list of tokens created by the specified address.
+    /// Results are ordered by token creation order (token index).
+    /// Useful for explorer and dashboard interfaces.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `creator` - Address of the token creator
+    /// * `cursor` - Optional cursor for pagination (None = start from beginning)
+    /// * `limit` - Maximum number of tokens to return (default 20, max 100)
+    ///
+    /// # Returns
+    /// Returns `PaginatedTokens` containing:
+    /// - `tokens`: Vector of TokenInfo for this page
+    /// - `cursor`: Optional cursor for next page (None = no more results)
+    ///
+    /// # Cursor Semantics
+    /// - Cursors are deterministic and stable across calls
+    /// - Empty cursor (None) starts from the beginning
+    /// - Returned cursor of None indicates end of results
+    /// - Cursors contain the next position in the creator's token list
+    ///
+    /// # Examples
+    /// ```
+    /// // First page
+    /// let page1 = factory.get_tokens_by_creator(&env, creator, None, Some(20))?;
+    /// 
+    /// // Next page
+    /// if let Some(cursor) = page1.cursor {
+    ///     let page2 = factory.get_tokens_by_creator(&env, creator, Some(cursor), Some(20))?;
+    /// }
+    /// 
+    /// // Get total count
+    /// let total = factory.get_creator_token_count(&env, creator);
+    /// ```
+    pub fn get_tokens_by_creator(
+        env: Env,
+        creator: Address,
+        cursor: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<types::PaginatedTokens, Error> {
+        pagination::get_tokens_by_creator(&env, &creator, cursor, limit)
+    }
+
+    /// Get the total number of tokens created by an address
+    ///
+    /// Returns the count without fetching the actual token data.
+    /// Useful for displaying total counts in UIs.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `creator` - Address of the token creator
+    ///
+    /// # Returns
+    /// Returns the number of tokens created by this address
+    ///
+    /// # Examples
+    /// ```
+    /// let count = factory.get_creator_token_count(&env, creator);
+    /// log!("Creator has deployed {} tokens", count);
+    /// ```
+    pub fn get_creator_token_count(env: Env, creator: Address) -> u32 {
+        pagination::get_creator_token_count(&env, &creator)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Minting Functions
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Mint tokens to an address
+    ///
+    /// Increases the total supply and the recipient's balance.
+    /// Enforces max supply constraints if set for the token.
+    /// Only the token creator can mint new tokens.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `creator` - Token creator address (must authorize)
+    /// * `token_index` - Index of the token to mint
+    /// * `to` - Address to receive the minted tokens
+    /// * `amount` - Amount to mint (must be > 0)
+    ///
+    /// # Returns
+    /// Returns `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `Error::Unauthorized` - Caller is not the token creator
+    /// * `Error::TokenNotFound` - Token doesn't exist
+    /// * `Error::InvalidAmount` - Amount is zero or negative
+    /// * `Error::MaxSupplyExceeded` - Would exceed max supply cap
+    /// * `Error::ArithmeticError` - Overflow in calculation
+    /// * `Error::ContractPaused` - Contract is paused
+    ///
+    /// # Examples
+    /// ```
+    /// // Mint 1000 tokens
+    /// factory.mint(&env, creator, 0, recipient, 1_000_0000000)?;
+    ///
+    /// // Check remaining mintable
+    /// if let Some(remaining) = factory.get_remaining_mintable(&env, 0) {
+    ///     log!("Can mint {} more tokens", remaining);
+    /// }
+    /// ```
+    pub fn mint(
+        env: Env,
+        creator: Address,
+        token_index: u32,
+        to: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        // Check if contract is paused
+        if storage::is_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+        
+        creator.require_auth();
+        
+        // Verify creator owns the token
+        let token_info = storage::get_token_info(&env, token_index)
+            .ok_or(Error::TokenNotFound)?;
+        
+        if token_info.creator != creator {
+            return Err(Error::Unauthorized);
+        }
+        
+        // Perform mint with max supply validation
+        mint::mint(&env, token_index, &to, amount)
+    }
+
+    /// Get remaining mintable supply for a token
+    ///
+    /// Returns how many more tokens can be minted before hitting the max supply.
+    /// Returns None if there's no max supply (unlimited minting).
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `token_index` - Index of the token
+    ///
+    /// # Returns
+    /// * `Some(amount)` - Remaining mintable amount
+    /// * `None` - Unlimited minting (no max supply set)
+    ///
+    /// # Examples
+    /// ```
+    /// match factory.get_remaining_mintable(&env, 0) {
+    ///     Some(0) => log!("Max supply reached"),
+    ///     Some(amount) => log!("Can mint {} more", amount),
+    ///     None => log!("Unlimited minting"),
+    /// }
+    /// ```
+    pub fn get_remaining_mintable(env: Env, token_index: u32) -> Option<i128> {
+        mint::get_remaining_mintable(&env, token_index)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Treasury Functions
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Initialize treasury policy
+    ///
+    /// Sets up withdrawal limits and controls for the treasury.
+    /// Should be called during contract initialization or when first
+    /// configuring treasury protections.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `admin` - Admin address (must authorize)
+    /// * `daily_cap` - Optional maximum withdrawal per day in stroops (None = default 100 XLM)
+    /// * `allowlist_enabled` - Whether to enforce recipient allowlist
+    ///
+    /// # Returns
+    /// Returns `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `Error::Unauthorized` - Caller is not the admin
+    /// * `Error::InvalidParameters` - Daily cap is negative
+    ///
+    /// # Examples
+    /// ```
+    /// // 100 XLM daily cap with allowlist
+    /// factory.initialize_treasury_policy(&env, admin, Some(100_0000000), true)?;
+    /// ```
+    pub fn initialize_treasury_policy(
+        env: Env,
+        admin: Address,
+        daily_cap: Option<i128>,
+        allowlist_enabled: bool,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        
+        let current_admin = storage::get_admin(&env);
+        if admin != current_admin {
+            return Err(Error::Unauthorized);
+        }
+        
+        treasury::initialize_treasury_policy(&env, daily_cap, allowlist_enabled)
+    }
+
+    /// Withdraw fees from treasury
+    ///
+    /// Transfers accumulated fees to a recipient address.
+    /// Enforces withdrawal policy limits and allowlist.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `admin` - Admin address (must authorize)
+    /// * `recipient` - Address to receive the funds
+    /// * `amount` - Amount to withdraw in stroops
+    ///
+    /// # Returns
+    /// Returns `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `Error::Unauthorized` - Caller is not admin
+    /// * `Error::WithdrawalCapExceeded` - Exceeds daily cap
+    /// * `Error::RecipientNotAllowed` - Recipient not in allowlist
+    /// * `Error::InvalidAmount` - Amount is zero or negative
+    ///
+    /// # Examples
+    /// ```
+    /// // Withdraw 50 XLM to recipient
+    /// factory.withdraw_fees(&env, admin, recipient, 50_0000000)?;
+    /// ```
+    pub fn withdraw_fees(
+        env: Env,
+        admin: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        treasury::withdraw_fees(&env, &admin, &recipient, amount)
+    }
+
+    /// Add recipient to allowlist
+    ///
+    /// Allows an address to receive treasury withdrawals.
+    /// Only admin can modify the allowlist.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `admin` - Admin address (must authorize)
+    /// * `recipient` - Address to add to allowlist
+    ///
+    /// # Returns
+    /// Returns `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `Error::Unauthorized` - Caller is not the admin
+    ///
+    /// # Examples
+    /// ```
+    /// factory.add_allowed_recipient(&env, admin, recipient)?;
+    /// ```
+    pub fn add_allowed_recipient(
+        env: Env,
+        admin: Address,
+        recipient: Address,
+    ) -> Result<(), Error> {
+        treasury::add_allowed_recipient(&env, &admin, &recipient)
+    }
+
+    /// Remove recipient from allowlist
+    ///
+    /// Revokes an address's ability to receive treasury withdrawals.
+    /// Only admin can modify the allowlist.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `admin` - Admin address (must authorize)
+    /// * `recipient` - Address to remove from allowlist
+    ///
+    /// # Returns
+    /// Returns `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `Error::Unauthorized` - Caller is not the admin
+    ///
+    /// # Examples
+    /// ```
+    /// factory.remove_allowed_recipient(&env, admin, recipient)?;
+    /// ```
+    pub fn remove_allowed_recipient(
+        env: Env,
+        admin: Address,
+        recipient: Address,
+    ) -> Result<(), Error> {
+        treasury::remove_allowed_recipient(&env, &admin, &recipient)
+    }
+
+    /// Update treasury policy
+    ///
+    /// Changes the withdrawal limits and allowlist settings.
+    /// Only admin can update the policy.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `admin` - Admin address (must authorize)
+    /// * `daily_cap` - Optional new daily cap in stroops (None = no change)
+    /// * `allowlist_enabled` - Optional new allowlist setting (None = no change)
+    ///
+    /// # Returns
+    /// Returns `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `Error::Unauthorized` - Caller is not the admin
+    /// * `Error::InvalidParameters` - Daily cap is negative
+    ///
+    /// # Examples
+    /// ```
+    /// // Update daily cap to 200 XLM
+    /// factory.update_treasury_policy(&env, admin, Some(200_0000000), None)?;
+    /// ```
+    pub fn update_treasury_policy(
+        env: Env,
+        admin: Address,
+        daily_cap: Option<i128>,
+        allowlist_enabled: Option<bool>,
+    ) -> Result<(), Error> {
+        treasury::update_treasury_policy(&env, &admin, daily_cap, allowlist_enabled)
+    }
+
+    /// Get remaining withdrawal capacity for current period
+    ///
+    /// Returns how much more can be withdrawn before hitting the daily cap.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    ///
+    /// # Returns
+    /// Remaining withdrawal capacity in stroops
+    ///
+    /// # Examples
+    /// ```
+    /// let remaining = factory.get_remaining_capacity(&env);
+    /// log!("Can withdraw {} more stroops today", remaining);
+    /// ```
+    pub fn get_remaining_capacity(env: Env) -> i128 {
+        treasury::get_remaining_capacity(&env)
+    }
+
+    /// Get treasury policy
+    ///
+    /// Returns the current withdrawal policy settings.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    ///
+    /// # Returns
+    /// Current treasury policy
+    ///
+    /// # Examples
+    /// ```
+    /// let policy = factory.get_treasury_policy(&env);
+    /// log!("Daily cap: {}", policy.daily_cap);
+    /// ```
+    pub fn get_treasury_policy(env: Env) -> types::TreasuryPolicy {
+        treasury::get_treasury_policy(&env)
+    }
+
+    /// Check if address is allowed recipient
+    ///
+    /// Returns true if the address can receive treasury withdrawals.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `recipient` - Address to check
+    ///
+    /// # Returns
+    /// True if address is in allowlist or allowlist is disabled
+    ///
+    /// # Examples
+    /// ```
+    /// if factory.is_allowed_recipient(&env, recipient) {
+    ///     log!("Recipient is allowed");
+    /// }
+    /// ```
+    pub fn is_allowed_recipient(env: Env, recipient: Address) -> bool {
+        treasury::is_allowed_recipient(&env, &recipient)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Stream Functions
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Update stream metadata (creator/admin only)
+    ///
+    /// Allows the stream creator or admin to update the metadata associated with
+    /// a stream. Only metadata is mutable post-creation; all financial terms
+    /// (amount, creator, recipient, schedule) remain immutable.
+    ///
+    /// This function enforces strict financial invariants to prevent any mutation
+    /// of critical stream parameters after creation.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `stream_id` - ID of the stream to update
+    /// * `updater` - Address performing the update (must be creator or admin)
+    /// * `new_metadata` - New metadata value (None to clear, Some(string) to set)
+    ///
+    /// # Returns
+    /// Returns `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `Error::TokenNotFound` - Stream with given ID does not exist
+    /// * `Error::Unauthorized` - Caller is not the stream creator or admin
+    /// * `Error::InvalidParameters` - New metadata is invalid (empty string or >512 chars)
+    /// * `Error::ContractPaused` - Contract is currently paused
+    ///
+    /// # Financial Invariants (Enforced)
+    /// The following stream parameters are immutable and cannot be changed:
+    /// - `amount` - Stream payment amount
+    /// - `creator` - Original stream creator
+    /// - `recipient` - Stream recipient address
+    /// - `created_at` - Stream creation timestamp
+    /// - `id` - Stream ID
+    ///
+    /// # Metadata Constraints
+    /// - Minimum length: 1 character (when present)
+    /// - Maximum length: 512 characters
+    /// - Empty strings: Rejected with `Error::InvalidParameters`
+    /// - None value: Allowed (clears metadata)
+    ///
+    /// # Examples
+    /// ```
+    /// // Update metadata with new label
+    /// factory.update_stream_metadata(
+    ///     &env,
+    ///     stream_id,
+    ///     &updater,
+    ///     Some(String::from_str(&env, "Updated label"))
+    /// )?;
+    ///
+    /// // Clear metadata
+    /// factory.update_stream_metadata(
+    ///     &env,
+    ///     stream_id,
+    ///     &updater,
+    ///     None
+    /// )?;
+    /// ```
+    ///
+    /// # Authorization
+    /// Only the original stream creator or the contract admin can update metadata.
+    /// The updater must authorize the transaction via `require_auth()`.
+    ///
+    /// # Events
+    /// Emits `stream_metadata_updated` event with:
+    /// - stream_id: The updated stream ID
+    /// - updater: Address that performed the update
+    /// - has_metadata: Whether metadata is now present (true) or cleared (false)
+    pub fn update_stream_metadata(
+        env: Env,
+        stream_id: u32,
+        updater: Address,
+        new_metadata: Option<String>,
+    ) -> Result<(), Error> {
+        // Require updater authorization
+        updater.require_auth();
+
+        // Early return if contract is paused
+        if storage::is_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+
+        // Get the stream
+        let mut stream = storage::get_stream(&env, stream_id)
+            .ok_or(Error::TokenNotFound)?;
+
+        // Verify authorization: only creator or admin can update
+        let admin = storage::get_admin(&env);
+        if updater != stream.creator && updater != admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Store original stream for invariant validation
+        let original_stream = stream.clone();
+
+        // Validate new metadata before applying
+        stream_types::validate_metadata(&new_metadata)?;
+
+        // Update metadata
+        stream.metadata = new_metadata.clone();
+
+        // Enforce financial invariants - ensure no financial terms changed
+        stream_types::validate_financial_invariants(&original_stream, &stream)?;
+
+        // Store updated stream
+        storage::set_stream(&env, stream_id, &stream);
+
+        // Emit metadata updated event
+        let has_metadata = new_metadata.is_some();
+        events::emit_stream_metadata_updated(&env, stream_id, &updater, has_metadata);
+
+        Ok(())
+    }
+
+}
 
 // Temporarily disabled - requires create_token implementation
 // #[cfg(test)]
@@ -973,6 +1987,9 @@ impl TokenFactory {
 // Temporarily disabled - has compilation errors
 // #[cfg(test)]
 // mod admin_transfer_test;
+
+#[cfg(test)]
+mod fee_collection_test;
 
 // Temporarily disabled - has compilation errors
 // mod event_tests;
@@ -1022,15 +2039,24 @@ mod fuzz_create_token_simple;
 // #[cfg(test)]
 // mod fuzz_test;
 
-// Temporarily disabled - has compilation errors
+#[cfg(test)]
+mod token_pause_test;
+
+
+#[cfg(test)]
+mod token_stats_test;
+
+mod integration_test;
+
+mod gas_benchmark_comprehensive;
+
+// Temporarily disabled due to compilation issues
 // #[cfg(test)]
-// mod integration_test;
+// mod fuzz_string_boundaries;
 
-// Temporarily disabled - has compilation errors
-// mod gas_benchmark_comprehensive;
-
-#[cfg(test)]
-mod stream_metadata_test;
+// Temporarily disabled due to compilation issues
+// #[cfg(test)]
+// mod fuzz_numeric_boundaries;
 
 #[cfg(test)]
-mod stream_auth_test;
+mod batch_token_creation_test;

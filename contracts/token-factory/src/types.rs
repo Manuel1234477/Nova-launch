@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use soroban_sdk::{contracterror, contracttype, Address, String};
+use soroban_sdk::{contracterror, contracttype, Address, String, Vec};
 
 /// Factory state containing administrative configuration
 ///
@@ -54,10 +54,14 @@ pub struct ContractMetadata {
 /// * `symbol` - Token symbol (e.g., "MTK")
 /// * `decimals` - Number of decimal places (typically 7 for Stellar)
 /// * `total_supply` - Current circulating supply after burns
+/// * `initial_supply` - Initial supply at token creation
+/// * `max_supply` - Optional maximum supply cap (None = unlimited)
 /// * `metadata_uri` - Optional IPFS URI for additional metadata
 /// * `created_at` - Unix timestamp of token creation
 /// * `total_burned` - Cumulative amount of tokens burned
 /// * `burn_count` - Number of burn operations performed
+/// * `metadata_uri` - Optional IPFS URI for additional metadata
+/// * `is_paused` - Token-level pause flag
 /// * `clawback_enabled` - Whether admin can burn from any address
 ///
 /// # Examples
@@ -75,11 +79,38 @@ pub struct TokenInfo {
     pub decimals: u32,
     pub total_supply: i128,
     pub initial_supply: i128,
+    pub max_supply: Option<i128>,
     pub total_burned: i128,
     pub burn_count: u32,
     pub metadata_uri: Option<String>,
     pub created_at: u64,
+    pub is_paused: bool,
     pub clawback_enabled: bool,
+}
+
+/// Compact read-only snapshot of a token's current state.
+/// Returned by get_token_stats().
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenStats {
+    pub current_supply: i128,
+    pub total_burned: i128,
+    pub burn_count: u32,
+    pub is_paused: bool,
+    pub has_clawback: bool,
+    pub clawback_enabled: bool,
+    pub freeze_enabled: bool,
+}
+
+/// Token creation parameters for batch operations
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenCreationParams {
+    pub name: String,
+    pub symbol: String,
+    pub decimals: u32,
+    pub initial_supply: i128,
+    pub metadata_uri: Option<String>,
 }
 
 /// Batch fee update structure for Phase 2 optimization
@@ -122,6 +153,14 @@ pub struct FeeUpdate {
 /// * `BurnCount(u32)` - Number of burns for token
 /// * `TokenByAddress(Address)` - Token info lookup by address
 /// * `Paused` - Contract pause state
+/// * `TimelockConfig` - Timelock configuration
+/// * `PendingChange(u64)` - Pending change by ID
+/// * `NextChangeId` - Next available change ID
+/// * `CreatorTokens(Address)` - Vector of token indices for a creator
+/// * `CreatorTokenCount(Address)` - Number of tokens created by address
+/// * `TreasuryPolicy` - Treasury withdrawal policy
+/// * `WithdrawalPeriod` - Current withdrawal period tracking
+/// * `AllowedRecipient(Address)` - Whether address is allowed recipient
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -130,13 +169,22 @@ pub enum DataKey {
     BaseFee,
     MetadataFee,
     TokenCount,
-    Token(u32),
-    Balance(u32, Address),
-    BurnCount(u32),
-    TokenByAddress(Address),
+    Token(u32),            // Token index -> TokenInfo
+    TokenByAddress(Address), // Token address -> TokenInfo
+    Balance(u32, Address), // (token_index, holder) -> i128
+    BurnCount(u32),        // token_index -> u32
     Paused,
+    TimelockConfig,
+    PendingChange(u64),
+    NextChangeId,
+    CreatorTokens(Address),
+    CreatorTokenCount(Address),
+    TreasuryPolicy,
+    WithdrawalPeriod,
+    AllowedRecipient(Address),
     StreamCount,
     Stream(u32),
+    StreamByCreator(Address, u32),
 }
 
 /// Contract error codes
@@ -144,26 +192,55 @@ pub enum DataKey {
 /// Defines all possible error conditions that can occur during
 /// contract execution. Each error has a unique numeric code.
 ///
-/// # Variants
-/// * `InsufficientFee` - Provided fee is less than required
-/// * `Unauthorized` - Caller lacks required permissions
-/// * `InvalidParameters` - Function arguments are invalid
-/// * `TokenNotFound` - Requested token does not exist
-/// * `MetadataAlreadySet` - Token metadata cannot be changed
-/// * `AlreadyInitialized` - Contract has already been initialized
-/// * `InsufficientBalance` - Account balance too low for operation
-/// * `ArithmeticError` - Numeric overflow or underflow occurred
-/// * `BatchTooLarge` - Batch operation exceeds maximum size
-/// * `InvalidAmount` - Amount is zero or negative
-/// * `ClawbackDisabled` - Clawback not enabled for this token
-/// * `InvalidBurnAmount` - Burn amount is invalid
-/// * `BurnAmountExceedsBalance` - Burn amount exceeds available balance
-/// * `ContractPaused` - Operation not allowed while paused
+/// # Error Code Mapping
+/// ## General Errors (1-9)
+/// * `InsufficientFee` (1) - Provided fee is less than required
+/// * `Unauthorized` (2) - Caller lacks required permissions
+/// * `InvalidParameters` (3) - Function arguments are invalid
+/// * `TokenNotFound` (4) - Requested token does not exist
+/// * `MetadataAlreadySet` (5) - Token metadata cannot be changed
+/// * `AlreadyInitialized` (6) - Contract has already been initialized
+/// * `InsufficientBalance` (7) - Account balance too low for operation
+/// * `ArithmeticError` (8) - Numeric overflow or underflow occurred
+/// * `BatchTooLarge` (9) - Batch operation exceeds maximum size
+///
+/// ## Token Errors (10-18)
+/// * `InvalidAmount` (10) - Amount is zero or negative
+/// * `ClawbackDisabled` (11) - Clawback not enabled for this token
+/// * `InvalidBurnAmount` (12) - Burn amount is invalid
+/// * `BurnAmountExceedsBalance` (13) - Burn amount exceeds available balance
+/// * `ContractPaused` (14) - Operation not allowed while paused
+/// * `TimelockNotExpired` (15) - Timelock period has not elapsed
+/// * `ChangeAlreadyExecuted` (16) - Change has already been executed
+/// * `MaxSupplyExceeded` (17) - Minting would exceed max supply cap
+/// * `InvalidMaxSupply` (18) - Max supply is less than initial supply
+///
+/// ## Treasury Errors (19-20)
+/// * `WithdrawalCapExceeded` (19) - Withdrawal would exceed daily cap
+/// * `RecipientNotAllowed` (20) - Recipient not in allowlist
+///
+/// ## Validation Errors (21-25)
+/// * `MissingAdmin` (21) - Admin address not set
+/// * `MissingTreasury` (22) - Treasury address not set
+/// * `InvalidBaseFee` (23) - Base fee is negative
+/// * `InvalidMetadataFee` (24) - Metadata fee is negative
+/// * `InconsistentTokenCount` (25) - Token count mismatch
+///
+/// ## Stream Errors (26-31)
+/// * `StreamNotFound` (26) - Requested stream does not exist
+/// * `InvalidSchedule` (27) - Stream schedule parameters are invalid
+/// * `CliffNotReached` (28) - Cliff period has not elapsed
+/// * `NothingToClaim` (29) - No tokens available to claim
+/// * `StreamPaused` (30) - Stream is paused
+/// * `StreamCancelled` (31) - Stream has been cancelled
 ///
 /// # Examples
 /// ```
 /// if amount <= 0 {
 ///     return Err(Error::InvalidAmount);
+/// }
+/// if stream_id >= stream_count {
+///     return Err(Error::StreamNotFound);
 /// }
 /// ```
 #[contracterror]
@@ -183,14 +260,106 @@ pub enum Error {
     InvalidBurnAmount = 12,
     BurnAmountExceedsBalance = 13,
     ContractPaused = 14,
-    MissingAdmin = 15,
-    MissingTreasury = 16,
-    InvalidBaseFee = 17,
-    InvalidMetadataFee = 18,
-    InconsistentTokenCount = 19,
-    StreamNotFound = 20,
-    StreamAlreadyClaimed = 21,
-    StreamPaused = 22,
-    StreamNotPaused = 23,
-    StreamCancelled = 24,
+    InvalidTokenParams = 15,
+    BatchCreationFailed = 16,
 }
+
+/// Type of pending change
+///
+/// Identifies which operation is being timelocked.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChangeType {
+    FeeUpdate,
+    PauseUpdate,
+    TreasuryUpdate,
+}
+
+/// Pending change awaiting timelock expiry
+///
+/// Represents a scheduled change that cannot be executed
+/// until the timelock period has elapsed.
+///
+/// # Fields
+/// * `id` - Unique identifier for this change
+/// * `change_type` - Type of change being scheduled
+/// * `scheduled_by` - Admin who scheduled the change
+/// * `scheduled_at` - Timestamp when change was scheduled
+/// * `execute_at` - Timestamp when change can be executed
+/// * `executed` - Whether the change has been executed
+/// * `base_fee` - New base fee (for FeeUpdate)
+/// * `metadata_fee` - New metadata fee (for FeeUpdate)
+/// * `paused` - New pause state (for PauseUpdate)
+/// * `treasury` - New treasury address (for TreasuryUpdate)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingChange {
+    pub id: u64,
+    pub change_type: ChangeType,
+    pub scheduled_by: Address,
+    pub scheduled_at: u64,
+    pub execute_at: u64,
+    pub executed: bool,
+    pub base_fee: Option<i128>,
+    pub metadata_fee: Option<i128>,
+    pub paused: Option<bool>,
+    pub treasury: Option<Address>,
+}
+
+/// Pagination cursor for token queries
+///
+/// Represents the position in a paginated result set.
+/// Uses token index as the cursor for deterministic ordering.
+///
+/// # Fields
+/// * `next_index` - The next token index to fetch (u32::MAX = end of results)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaginationCursor {
+    pub next_index: u32,
+}
+
+/// Paginated token result
+///
+/// Contains a page of tokens and a cursor for fetching the next page.
+///
+/// # Fields
+/// * `tokens` - Vector of token info for this page
+/// * `cursor` - Cursor for next page (None = no more results)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaginatedTokens {
+    pub tokens: soroban_sdk::Vec<TokenInfo>,
+    pub cursor: Option<u32>,
+}
+
+/// Treasury withdrawal policy
+///
+/// Defines limits and controls for treasury withdrawals.
+///
+/// # Fields
+/// * `daily_cap` - Maximum amount that can be withdrawn per day (in stroops)
+/// * `allowlist_enabled` - Whether recipient allowlist is enforced
+/// * `period_duration` - Duration of withdrawal period in seconds (default 86400 = 1 day)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryPolicy {
+    pub daily_cap: i128,
+    pub allowlist_enabled: bool,
+    pub period_duration: u64,
+}
+
+/// Treasury withdrawal tracking for current period
+///
+/// Tracks withdrawals within the current time period.
+///
+/// # Fields
+/// * `period_start` - Timestamp when current period started
+/// * `amount_withdrawn` - Total amount withdrawn in current period
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalPeriod {
+    pub period_start: u64,
+    pub amount_withdrawn: i128,
+}
+
