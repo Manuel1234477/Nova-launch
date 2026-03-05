@@ -760,6 +760,16 @@ impl TokenFactory {
 
     /// Get stream information by ID
     ///
+    /// Retrieves complete vesting stream details including schedule,
+    /// amounts, and metadata. This is a read-only operation.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `stream_id` - Unique stream identifier
+    ///
+    /// # Returns
+    /// Returns `StreamInfo` with all stream details
+    ///
     /// # Errors
     /// * `Error::StreamNotFound` - Stream ID does not exist
     pub fn get_stream(env: Env, stream_id: u32) -> Result<stream_types::StreamInfo, Error> {
