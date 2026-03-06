@@ -254,6 +254,7 @@ pub enum Error {
     VotingNotStarted = 35,
     VotingEnded = 36,
     AlreadyVoted = 37,
+    StreamPaused = 38,
 }
 
 /// Type of pending change
@@ -439,6 +440,7 @@ pub struct StreamInfo {
     pub end_time: u64,
     pub cliff_time: u64,
     pub cancelled: bool,
+    pub paused: bool,
 }
 
 /// Stream creation parameters

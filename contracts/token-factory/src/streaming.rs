@@ -52,6 +52,7 @@ pub fn create_stream(
         end_time: params.end_time,
         cliff_time: params.cliff_time,
         cancelled: false,
+        paused: false,
     };
     
     // Store stream
@@ -134,6 +135,7 @@ pub fn batch_create_streams(
             end_time: stream_params.end_time,
             cliff_time: stream_params.cliff_time,
             cancelled: false,
+            paused: false,
         };
         
         storage::set_stream(env, stream_id, &stream);
@@ -214,6 +216,10 @@ pub fn claim_stream(
     // Check if cancelled
     if stream.cancelled {
         return Err(Error::InvalidParameters);
+    }
+
+    if stream.paused {
+        return Err(Error::StreamPaused);
     }
     
     // Calculate claimable amount
@@ -382,6 +388,60 @@ pub fn cancel_stream(
     Ok(())
 }
 
+/// Pause a stream
+///
+/// Allows creator to temporarily suspend claims on a stream.
+pub fn pause_stream(
+    env: &Env,
+    creator: &Address,
+    stream_id: u64,
+) -> Result<(), Error> {
+    creator.require_auth();
+    
+    let mut stream = storage::get_stream(env, stream_id)
+        .ok_or(Error::TokenNotFound)?;
+        
+    if stream.creator != *creator {
+        return Err(Error::Unauthorized);
+    }
+    
+    if stream.cancelled {
+        return Err(Error::InvalidParameters);
+    }
+    
+    stream.paused = true;
+    storage::set_stream(env, stream_id, &stream);
+    
+    Ok(())
+}
+
+/// Unpause a stream
+///
+/// Allows creator to resume a paused stream.
+pub fn unpause_stream(
+    env: &Env,
+    creator: &Address,
+    stream_id: u64,
+) -> Result<(), Error> {
+    creator.require_auth();
+    
+    let mut stream = storage::get_stream(env, stream_id)
+        .ok_or(Error::TokenNotFound)?;
+        
+    if stream.creator != *creator {
+        return Err(Error::Unauthorized);
+    }
+    
+    if stream.cancelled {
+        return Err(Error::InvalidParameters);
+    }
+    
+    stream.paused = false;
+    storage::set_stream(env, stream_id, &stream);
+    
+    Ok(())
+}
+
 /// Get stream information
 pub fn get_stream(env: &Env, stream_id: u64) -> Option<StreamInfo> {
     storage::get_stream(env, stream_id)
@@ -398,7 +458,7 @@ pub fn get_claimable_amount(env: &Env, stream_id: u64) -> Result<i128, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, vec, Env};
+    use soroban_sdk::{testutils::{Address as _, Ledger}, Env};
     
     fn setup() -> (Env, Address, Address) {
         let env = Env::default();
@@ -480,6 +540,8 @@ mod tests {
             end_time: 200,
             cliff_time: 150,
             cancelled: false,
+            paused: false,
+            
         };
         
         // Set time before cliff
@@ -506,6 +568,7 @@ mod tests {
             end_time: 200,
             cliff_time: 150,
             cancelled: false,
+            paused: false,
         };
         
         // Set time after cliff (halfway through vesting)
@@ -532,6 +595,7 @@ mod tests {
             end_time: 200,
             cliff_time: 150,
             cancelled: false,
+            paused: false,
         };
         
         // Set time after end
@@ -542,4 +606,49 @@ mod tests {
         let claimable = calculate_claimable(&env, &stream).unwrap();
         assert_eq!(claimable, 1000); // 100% vested
     }
+
+    #[test]
+    fn test_pause_and_unpause_stream() {
+        let (env, creator, recipient) = setup();
+        
+        let mut stream = StreamInfo {
+            id: 1,
+            creator: creator.clone(),
+            recipient: recipient.clone(),
+            token_index: 0,
+            total_amount: 1000,
+            claimed_amount: 0,
+            start_time: 100,
+            end_time: 200,
+            cliff_time: 150,
+            cancelled: false,
+            paused: false,
+        };
+        
+        // Mock save stream to storage
+        storage::set_stream(&env, 1, &stream);
+        
+        // Advance time to make it claimable
+        env.ledger().with_mut(|li| { li.timestamp = 160; });
+        
+        // 1. Pause the stream
+        assert!(pause_stream(&env, &creator, 1).is_ok());
+        
+        // 2. Verify claims are blocked
+        let claim_res = claim_stream(&env, &recipient, 1);
+        assert_eq!(claim_res, Err(Error::StreamPaused));
+        
+        // 3. Verify Authorization (recipient cannot unpause)
+        let unpause_res = unpause_stream(&env, &recipient, 1);
+        assert_eq!(unpause_res, Err(Error::Unauthorized));
+        
+        // 4. Unpause the stream as creator
+        assert!(unpause_stream(&env, &creator, 1).is_ok());
+        
+        // 5. Verify claims resume normally
+        let claim_success = claim_stream(&env, &recipient, 1);
+        assert!(claim_success.is_ok());
+        assert!(claim_success.unwrap() > 0);
+    }
+
 }

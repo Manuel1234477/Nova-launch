@@ -17,8 +17,6 @@ mod treasury;
 mod vesting;
 mod stream_types;
 mod differential_engine;
-mod stream_types;
-mod token_creation;
 #[cfg(test)]
 mod test_helpers;
 #[cfg(test)]
@@ -1949,6 +1947,31 @@ impl TokenFactory {
     }
 =======
 >>>>>>> main
+
+    /// Pause a payment stream
+    ///
+    /// Temporarily prevents any claims from the stream.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `creator` - Address of the stream creator (must authorize)
+    /// * `stream_id` - ID of the stream to pause
+    pub fn pause_stream(env: Env, creator: Address, stream_id: u64) -> Result<(), Error> {
+        streaming::pause_stream(&env, &creator, stream_id)
+    }
+
+    /// Unpause a payment stream
+    ///
+    /// Resumes normal claiming operations for a paused stream.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `creator` - Address of the stream creator (must authorize)
+    /// * `stream_id` - ID of the stream to unpause
+    pub fn unpause_stream(env: Env, creator: Address, stream_id: u64) -> Result<(), Error> {
+        streaming::unpause_stream(&env, &creator, stream_id)
+    }
+    
 }
 
 // Temporarily disabled - requires create_token implementation
