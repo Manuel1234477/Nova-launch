@@ -1607,6 +1607,38 @@ impl TokenFactory {
         streaming::claim_stream(&env, &recipient, stream_id)
     }
 
+    /// Batch claim vested tokens from multiple streams
+    ///
+    /// Allows recipient to claim tokens that have vested according to schedule
+    /// from multiple streams in a single transaction. Streams that cannot be
+    /// claimed (e.g. before cliff or zero remaining) are skipped without error.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `recipient` - Address claiming tokens (must authorize)
+    /// * `stream_ids` - Vector of stream IDs to claim from
+    ///
+    /// # Returns
+    /// Returns a vector of claimed amounts matching the input order
+    ///
+    /// # Errors
+    /// * `Error::Unauthorized` - Caller is not the recipient for one of the streams
+    /// * `Error::TokenNotFound` - Stream not found
+    /// * `Error::InvalidParameters` - Stream cancelled
+    ///
+    /// # Examples
+    /// ```
+    /// let stream_ids = vec![&env, stream_id1, stream_id2];
+    /// let claimed_amounts = factory.batch_claim(&env, recipient, stream_ids)?;
+    /// ```
+    pub fn batch_claim(
+        env: Env,
+        recipient: Address,
+        stream_ids: Vec<u64>,
+    ) -> Result<Vec<i128>, Error> {
+        streaming::batch_claim(&env, &recipient, &stream_ids)
+    }
+
     /// Cancel a stream
     ///
     /// Allows creator to cancel a stream. Recipient can still claim vested amount.
@@ -1775,3 +1807,6 @@ mod stateful_model_test;
 
 #[cfg(test)]
 mod stateful_model_based_test;
+
+#[cfg(test)]
+mod batch_claim_test;
