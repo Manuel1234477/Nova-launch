@@ -71,8 +71,8 @@ pub struct ContractMetadata {
 /// ```
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TokenInfo {
-    pub address: Address,
+pub struct Stream {
+    pub stream_id: String,
     pub creator: Address,
     pub name: String,
     pub symbol: String,

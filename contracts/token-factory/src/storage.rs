@@ -1,6 +1,6 @@
 use soroban_sdk::{Address, Env};
 
-use crate::types::{DataKey, FactoryState, TokenInfo};
+use crate::types::{DataKey, FactoryState, TokenInfo, Stream, StreamStatus};
 
 // ============================================================
 // Storage Functions - Burn Tracking
