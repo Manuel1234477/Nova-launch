@@ -17,13 +17,11 @@ mod treasury;
 mod vesting;
 mod stream_types;
 mod differential_engine;
-mod stream_types;
-mod token_creation;
 mod proposal_state_machine;
-// #[cfg(test)]
-// mod differential_engine;
 #[cfg(test)]
 mod test_helpers;
+#[cfg(test)]
+mod governance_events_versioning_test;
 // #[cfg(test)]
 // mod creator_streams_test;
 // Temporarily disabled - has compilation errors
