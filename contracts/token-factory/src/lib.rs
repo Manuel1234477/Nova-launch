@@ -6,6 +6,7 @@ mod freeze_functions;
 mod governance;
 
 mod burn;
+mod buyback;
 mod differential_engine;
 mod event_versions;
 mod events;
@@ -27,6 +28,9 @@ mod treasury;
 mod types;
 mod vesting;
 mod validation;
+
+#[cfg(test)]
+mod campaign_state_test;
 
 #[cfg(test)]
 mod governance_property_test;
@@ -2084,6 +2088,8 @@ impl TokenFactory {
 mod gas_benchmark_comprehensive;
 #[cfg(all(test, feature = "legacy-tests"))]
 mod gas_regression_test;
+#[cfg(test)]
+mod gas_compute_thresholds;
 
 #[cfg(test)]
 // mod timelock_test;
