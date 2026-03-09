@@ -46,6 +46,7 @@
 /// - Data types for all parameters must remain unchanged
 ///
 /// Any schema changes require creating a new version (e.g., init_v2).
+
 use soroban_sdk::{symbol_short, Address, BytesN, Env, String};
 
 /// Emit initialized event (v1)
@@ -521,194 +522,25 @@ pub fn emit_vault_created(
     );
 }
 
-/// Published when a vault is successfully claimed
-pub fn emit_vault_claimed(
+/// Emit vault claimed event
+///
+/// Published when a vault owner claims unlocked tokens.
+pub fn emit_vault_claimed(env: &Env, vault_id: u64, owner: &Address, amount: i128) {
+    env.events()
+        .publish((symbol_short!("vlt_clm"), vault_id), (owner.clone(), amount));
+}
+
+/// Emit vault cancelled event
+///
+/// Published when a vault is cancelled by an authorized actor.
+pub fn emit_vault_cancelled(
     env: &Env,
     vault_id: u64,
-    owner: &Address,
-    amount: i128,
+    actor: &Address,
+    remaining_amount: i128,
 ) {
     env.events().publish(
-        (symbol_short!("vlt_clm"), vault_id),
-        (owner.clone(), amount),
+        (symbol_short!("vlt_cnl"), vault_id),
+        (actor.clone(), remaining_amount),
     );
-}
-
-// ── Governance events (versioned for long-term indexer compatibility) ─────────────────────────────────────────
-
-/// Emit proposal created event (v1)
-///
-/// **Schema Version**: 1
-/// **Event Name**: prop_cr_v1 (abbreviated to fit 9-char limit)
-///
-/// **Topics** (indexed):
-/// - Event name: "prop_cr_v1"
-/// - proposal_id: u64 - The newly created proposal ID
-///
-/// **Payload** (non-indexed):
-/// - proposer: Address - The address that created the proposal
-/// - action_type: ActionType - The type of action being proposed
-/// - start_time: u64 - Voting start timestamp
-/// - end_time: u64 - Voting end timestamp
-/// - eta: u64 - Estimated execution time
-///
-/// **Schema Stability**: This schema is immutable. Any changes require a new version.
-///
-/// Emitted when a new governance proposal is created
-pub fn emit_proposal_created_v1(
-    env: &Env,
-    proposal_id: u64,
-    proposer: &Address,
-    action_type: crate::types::ActionType,
-    start_time: u64,
-    end_time: u64,
-    eta: u64,
-) {
-    env.events().publish(
-        (symbol_short!("prop_crv1"), proposal_id),
-        (proposer, action_type, start_time, end_time, eta),
-    );
-}
-
-/// Emit vote cast event (v1)
-///
-/// **Schema Version**: 1
-/// **Event Name**: vote_cs_v1 (abbreviated to fit 9-char limit)
-///
-/// **Topics** (indexed):
-/// - Event name: "vote_cs_v1"
-/// - proposal_id: u64 - The proposal being voted on
-///
-/// **Payload** (non-indexed):
-/// - voter: Address - The address that cast the vote
-/// - vote_choice: VoteChoice - The vote choice (For, Against, Abstain)
-///
-/// **Schema Stability**: This schema is immutable. Any changes require a new version.
-///
-/// Emitted when a vote is cast on a governance proposal
-pub fn emit_vote_cast_v1(
-    env: &Env,
-    proposal_id: u64,
-    voter: &Address,
-    vote_choice: crate::types::VoteChoice,
-) {
-    env.events().publish(
-        (symbol_short!("vote_csv1"), proposal_id),
-        (voter, vote_choice),
-    );
-}
-
-/// Emit proposal queued event (v1)
-///
-/// **Schema Version**: 1
-/// **Event Name**: prop_qu_v1 (abbreviated to fit 9-char limit)
-///
-/// **Topics** (indexed):
-/// - Event name: "prop_qu_v1"
-/// - proposal_id: u64 - The proposal being queued
-///
-/// **Payload** (non-indexed):
-/// - eta: u64 - Estimated execution time
-///
-/// **Schema Stability**: This schema is immutable. Any changes require a new version.
-///
-/// Emitted when a proposal is queued for execution (after voting succeeds)
-pub fn emit_proposal_queued_v1(env: &Env, proposal_id: u64, eta: u64) {
-    env.events()
-        .publish((symbol_short!("prop_quv1"), proposal_id), (eta,));
-}
-
-/// Emit proposal executed event (v1)
-///
-/// **Schema Version**: 1
-/// **Event Name**: prop_ex_v1 (abbreviated to fit 9-char limit)
-///
-/// **Topics** (indexed):
-/// - Event name: "prop_ex_v1"
-/// - proposal_id: u64 - The proposal being executed
-///
-/// **Payload** (non-indexed):
-/// - executor: Address - The address that executed the proposal
-/// - success: bool - Whether execution succeeded
-///
-/// **Schema Stability**: This schema is immutable. Any changes require a new version.
-///
-/// Emitted when a proposal is executed
-pub fn emit_proposal_executed_v1(env: &Env, proposal_id: u64, executor: &Address, success: bool) {
-    env.events().publish(
-        (symbol_short!("prop_exv1"), proposal_id),
-        (executor, success),
-    );
-}
-
-/// Emit proposal cancelled event (v1)
-///
-/// **Schema Version**: 1
-/// **Event Name**: prop_ca_v1 (abbreviated to fit 9-char limit)
-///
-/// **Topics** (indexed):
-/// - Event name: "prop_ca_v1"
-/// - proposal_id: u64 - The proposal being cancelled
-///
-/// **Payload** (non-indexed):
-/// - canceller: Address - The address that cancelled the proposal
-///
-/// **Schema Stability**: This schema is immutable. Any changes require a new version.
-///
-/// Emitted when a proposal is cancelled
-pub fn emit_proposal_cancelled_v1(env: &Env, proposal_id: u64, canceller: &Address) {
-    env.events()
-        .publish((symbol_short!("prop_cav1"), proposal_id), (canceller,));
-}
-
-// ── Aliases for backward compatibility ───────────────────────
-
-pub fn emit_proposal_created(
-    env: &Env,
-    proposal_id: u64,
-    proposer: &Address,
-    action_type: crate::types::ActionType,
-    start_time: u64,
-    end_time: u64,
-    eta: u64,
-) {
-    emit_proposal_created_v1(
-        env,
-        proposal_id,
-        proposer,
-        action_type,
-        start_time,
-        end_time,
-        eta,
-    );
-}
-
-pub fn emit_vote_cast(
-    env: &Env,
-    proposal_id: u64,
-    voter: &Address,
-    vote_choice: crate::types::VoteChoice,
-) {
-    emit_vote_cast_v1(env, proposal_id, voter, vote_choice);
-}
-
-pub fn emit_proposal_voted(
-    env: &Env,
-    proposal_id: u64,
-    voter: &Address,
-    vote_choice: crate::types::VoteChoice,
-) {
-    emit_vote_cast_v1(env, proposal_id, voter, vote_choice);
-}
-
-pub fn emit_proposal_queued(env: &Env, proposal_id: u64, eta: u64) {
-    emit_proposal_queued_v1(env, proposal_id, eta);
-}
-
-pub fn emit_proposal_executed(env: &Env, proposal_id: u64, executor: &Address, success: bool) {
-    emit_proposal_executed_v1(env, proposal_id, executor, success);
-}
-
-pub fn emit_proposal_cancelled(env: &Env, proposal_id: u64, canceller: &Address) {
-    emit_proposal_cancelled_v1(env, proposal_id, canceller);
 }

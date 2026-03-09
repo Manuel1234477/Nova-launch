@@ -1,5 +1,5 @@
 [workspace]
-members = ["token-factory"]
+members = ["token-factory", "governance"]
 resolver = "2"
 
 [profile.ci]
