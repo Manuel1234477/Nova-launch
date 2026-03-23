@@ -36,7 +36,7 @@ export const CampaignDashboard: React.FC<CampaignDashboardProps> = ({
   const fetchCampaign = async () => {
     try {
       setLoading(true);
-      const response = await fetch(`/api/buyback/campaigns/${campaignId}`);
+      const response = await fetch(`/api/campaigns/${campaignId}`);
       
       if (!response.ok) {
         throw new Error('Failed to fetch campaign');
