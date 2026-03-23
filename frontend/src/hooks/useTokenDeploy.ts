@@ -11,6 +11,7 @@ import { IPFSService } from '../services/IPFSService';
 import { StellarService, getDeploymentFeeBreakdown } from '../services/StellarService';
 import { analytics, AnalyticsEvent } from '../services/analytics';
 import { useAnalytics } from './useAnalytics';
+import { transactionHistoryStorage } from '../services/TransactionHistoryStorage';
 
 const STATUS_MESSAGES: Record<DeploymentStatus, string> = {
     idle: '',
@@ -130,7 +131,11 @@ export function useTokenDeploy(network: 'testnet' | 'mainnet', options: UseToken
                     decimals: params.decimals || 0,
                 });
             } catch {}
+            
+            // Save optimistic record to local storage
+            // Backend sync will happen via useTransactionHistory
             saveDeploymentRecord(params, result, metadataUri);
+            
             setStatus('success');
             trackTokenDeployed(params.symbol, network);
             return result;
@@ -205,6 +210,10 @@ export function useTokenDeploy(network: 'testnet' | 'mainnet', options: UseToken
     };
 }
 
+/**
+ * Save deployment record to local storage (optimistic update)
+ * Backend sync will reconcile this later
+ */
 function saveDeploymentRecord(
     params: TokenDeployParams,
     result: DeploymentResult,
@@ -222,10 +231,8 @@ function saveDeploymentRecord(
         transactionHash: result.transactionHash,
     };
 
-    const storageKey = `tokens_${params.adminWallet}`;
-    const existingRaw = localStorage.getItem(storageKey);
-    const existing = existingRaw ? (JSON.parse(existingRaw) as TokenInfo[]) : [];
-    localStorage.setItem(storageKey, JSON.stringify([token, ...existing]));
+    // Use the new TransactionHistoryStorage service
+    transactionHistoryStorage.addToken(params.adminWallet, token);
 }
 
 function mapDeploymentError(error: unknown): AppError {
