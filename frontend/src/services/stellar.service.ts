@@ -20,6 +20,7 @@ import { ErrorCode } from '../types';
 
 import { WalletService } from './wallet';
 import type { ProposalParams, VoteParams } from '../types/governance';
+import type { OnChainBuybackCampaign } from '../types/campaign';
 
 export interface TransactionDetails {
   hash: string;
@@ -99,6 +100,61 @@ export class StellarService {
     };
   }
 
+  async createBuybackCampaign(params: {
+    creatorAddress: string;
+    tokenIndex: number;
+    budget: bigint;
+    startTime: number;
+    endTime: number;
+    minInterval: number;
+    maxSlippageBps: number;
+    sourceToken: string;
+    targetToken: string;
+  }): Promise<{ txHash: string; campaignId: string }> {
+    if (!this.contractClient) {
+      throw this.createError(ErrorCode.CONTRACT_ERROR, 'Contract client not initialized');
+    }
+
+    const walletService = new WalletService();
+    const account = await this.server.getAccount(params.creatorAddress);
+
+    const operation = this.contractClient.call(
+      'create_buyback_campaign',
+      nativeToScVal(params.creatorAddress, { type: 'address' }),
+      nativeToScVal(params.tokenIndex, { type: 'u32' }),
+      nativeToScVal(params.budget, { type: 'i128' }),
+      nativeToScVal(params.startTime, { type: 'u64' }),
+      nativeToScVal(params.endTime, { type: 'u64' }),
+      nativeToScVal(params.minInterval, { type: 'u64' }),
+      nativeToScVal(params.maxSlippageBps, { type: 'u32' }),
+      nativeToScVal(params.sourceToken, { type: 'address' }),
+      nativeToScVal(params.targetToken, { type: 'address' })
+    );
+
+    const transaction = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(operation)
+      .setTimeout(180)
+      .build();
+
+    const preparedTx = await this.server.prepareTransaction(transaction);
+    const signedXdr = await walletService.signTransaction(preparedTx.toXDR());
+    const signedTx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase) as Transaction;
+
+    const response = await this.server.sendTransaction(signedTx);
+    if (response.status === 'ERROR') {
+      throw this.createError(ErrorCode.TRANSACTION_FAILED, 'Transaction submission failed');
+    }
+
+    const confirmed = await this.waitForTransaction(response.hash);
+    const campaignId: string =
+      confirmed.returnValue ? scValToNative(confirmed.returnValue).toString() : '0';
+
+    return { txHash: response.hash, campaignId };
+  }
+
   async executeBuybackStep(
     campaignId: number,
     executorAddress: string
@@ -161,7 +217,7 @@ export class StellarService {
     }
   }
 
-  async getCampaign(campaignId: number): Promise<any> {
+  async getBuybackCampaign(campaignId: number): Promise<OnChainBuybackCampaign> {
     if (!this.contractClient) {
       throw this.createError(
         ErrorCode.CONTRACT_ERROR,
@@ -171,7 +227,7 @@ export class StellarService {
 
     try {
       const operation = this.contractClient.call(
-        'get_campaign',
+        'get_buyback_campaign',
         nativeToScVal(campaignId, { type: 'u64' })
       );
 
@@ -187,14 +243,15 @@ export class StellarService {
       const simulated = await this.server.simulateTransaction(transaction);
 
       if (Soroban.Api.isSimulationSuccess(simulated)) {
-        return scValToNative(simulated.result!.retval);
+        const raw = scValToNative(simulated.result!.retval) as OnChainBuybackCampaign;
+        return raw;
       }
 
       throw new Error('Simulation failed');
     } catch (error) {
       throw this.createError(
         ErrorCode.CONTRACT_ERROR,
-        'Failed to get campaign',
+        'Failed to get buyback campaign',
         error instanceof Error ? error.message : undefined
       );
     }
@@ -242,7 +299,6 @@ export class StellarService {
       return false;
     }
   }
-}
 
   async fundTestAccount(publicKey: string): Promise<void> {
     try {
