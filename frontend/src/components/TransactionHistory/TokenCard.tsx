@@ -1,13 +1,25 @@
 import { useState, useEffect } from 'react';
 import { Card } from '../UI/Card';
 import { Button } from '../UI/Button';
-import { Spinner } from '../UI/Spinner';
-import { truncateAddress } from '../../utils/formatting';
+import {
+    truncateAddress,
+    formatTokenSupply,
+    formatBurnStats,
+} from '../../utils/formatting';
 import type { TokenInfo } from '../../types';
 import { fetchTokenDetail, type TokenDetail, invalidateTokenCache } from '../../services/tokenInfoApi';
 
+/**
+ * Extended token info with indexed metadata from backend
+ */
+export interface IndexedTokenCardData extends TokenInfo {
+    initialSupply?: string;
+    totalBurned?: string;
+    burnCount?: number;
+}
+
 interface TokenCardProps {
-    token: TokenInfo;
+    token: IndexedTokenCardData;
     network: 'testnet' | 'mainnet';
     /** Whether to fetch enriched data from backend */
     fetchEnrichedData?: boolean;
@@ -80,9 +92,11 @@ export function TokenCard({ token, network, fetchEnrichedData = true, onDetailLo
         ? `https://stellar.expert/explorer/testnet/contract/${token.address}`
         : `https://stellar.expert/explorer/public/contract/${token.address}`;
 
-    const txUrl = network === 'testnet'
-        ? `https://stellar.expert/explorer/testnet/tx/${token.transactionHash}`
-        : `https://stellar.expert/explorer/public/tx/${token.transactionHash}`;
+    const txUrl = token.transactionHash
+        ? network === 'testnet'
+            ? `https://stellar.expert/explorer/testnet/tx/${token.transactionHash}`
+            : `https://stellar.expert/explorer/public/tx/${token.transactionHash}`
+        : null;
 
     const handleCopy = async () => {
         await navigator.clipboard.writeText(token.address);
@@ -96,10 +110,17 @@ export function TokenCard({ token, network, fetchEnrichedData = true, onDetailLo
         day: 'numeric',
     });
 
-    // Use enriched metadata if available, otherwise fall back to token data
-    const displayName = enrichedData?.metadata?.name || token.name;
-    const displaySymbol = enrichedData?.metadata?.name ? token.symbol : token.symbol;
-    const displayImage = enrichedData?.metadata?.image || token.metadataUri;
+    const hasBurnData = token.totalBurned !== undefined && token.initialSupply !== undefined;
+    const burnStats = hasBurnData
+        ? formatBurnStats(
+              token.totalBurned!,
+              token.burnCount || 0,
+              token.initialSupply!,
+              token.decimals
+          )
+        : null;
+
+    const hasBurns = hasBurnData && token.burnCount && token.burnCount > 0;
 
     return (
         <Card className="hover:shadow-lg transition-shadow">
@@ -115,6 +136,9 @@ export function TokenCard({ token, network, fetchEnrichedData = true, onDetailLo
                         src={displayImage}
                         alt={displayName}
                         className="w-full h-32 object-cover rounded-md"
+                        onError={(e) => {
+                            (e.target as HTMLImageElement).style.display = 'none';
+                        }}
                     />
                 )}
 
@@ -190,6 +214,27 @@ export function TokenCard({ token, network, fetchEnrichedData = true, onDetailLo
                     </div>
 
                     <div className="flex items-center justify-between">
+                        <span className="text-gray-600">Supply:</span>
+                        <span className="text-gray-900 font-mono">
+                            {formatTokenSupply(token.totalSupply, token.decimals, { compact: true })}
+                        </span>
+                    </div>
+
+                    {hasBurns && burnStats && (
+                        <div className="flex items-center justify-between">
+                            <span className="text-gray-600">Burned:</span>
+                            <div className="flex items-center gap-2">
+                                <span className="text-orange-600 font-mono">
+                                    {burnStats.burnedAmount}
+                                </span>
+                                <span className="text-xs text-gray-500">
+                                    ({burnStats.percentage})
+                                </span>
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="flex items-center justify-between">
                         <span className="text-gray-600">Deployed:</span>
                         <span className="text-gray-900">{deployDate}</span>
                     </div>
@@ -204,14 +249,16 @@ export function TokenCard({ token, network, fetchEnrichedData = true, onDetailLo
                     >
                         View Token
                     </Button>
-                    <Button
-                        variant="outline"
-                        size="sm"
-                        className="flex-1"
-                        onClick={() => window.open(txUrl, '_blank')}
-                    >
-                        View TX
-                    </Button>
+                    {txUrl && (
+                        <Button
+                            variant="outline"
+                            size="sm"
+                            className="flex-1"
+                            onClick={() => window.open(txUrl, '_blank')}
+                        >
+                            View TX
+                        </Button>
+                    )}
                 </div>
             </div>
         </Card>
