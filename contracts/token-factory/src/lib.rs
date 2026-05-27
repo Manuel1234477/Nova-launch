@@ -130,6 +130,12 @@ mod multisig_auth_fuzz_test;
 #[cfg(all(test, feature = "legacy-tests"))]
 mod burn_integration_test;
 
+#[cfg(test)]
+mod batch_atomicity_test;
+
+#[cfg(test)]
+mod vault_deposit_withdraw_test;
+
 use soroban_sdk::{contract, contractimpl, symbol_short, Address, Bytes, BytesN, Env, String, Symbol, Vec};
 use types::{
     AuctionStatus, BurnAuction, BuybackCampaign, CampaignStatus, ContractMetadata,
