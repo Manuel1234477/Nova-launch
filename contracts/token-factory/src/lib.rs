@@ -3148,8 +3148,9 @@ impl TokenFactory {
     /// * `threshold` – Number of approvals required to execute a proposal.
     ///
     /// # Errors
-    /// * `Unauthorized`     – Caller is not the admin.
-    /// * `InvalidThreshold` – Threshold is 0 or exceeds the number of signers.
+    /// * `Unauthorized`         – Caller is not the admin.
+    /// * `InvalidThreshold`     – Threshold is 0 or exceeds the number of signers.
+    /// * `DuplicateSigners`     – Signers list contains duplicate addresses.
     pub fn configure_multisig(
         env: Env,
         admin: Address,
@@ -3164,14 +3165,25 @@ impl TokenFactory {
         }
 
         let signer_count = signers.len();
-        if threshold == 0 || threshold > signer_count {
+
+        // Validate threshold
+        if threshold == 0 || threshold > signer_count as u32 {
             return Err(Error::InvalidThreshold);
+        }
+
+        // Validate no duplicate signers
+        for i in 0..signer_count {
+            for j in (i + 1)..signer_count {
+                if signers.get_unchecked(i) == signers.get_unchecked(j) {
+                    return Err(Error::DuplicateSigners);
+                }
+            }
         }
 
         let config = types::MultiSigConfig { signers, threshold };
         storage::set_multisig_config(&env, &config);
 
-        events::emit_multisig_configured(&env, &admin, threshold, signer_count);
+        events::emit_multisig_configured(&env, &admin, threshold, signer_count as u32);
 
         Ok(())
     }

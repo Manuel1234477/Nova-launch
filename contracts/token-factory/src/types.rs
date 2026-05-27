@@ -896,6 +896,7 @@ impl Error {
     pub const BurnScheduleAlreadyExecuted: Self = Self(83);
     pub const BurnScheduleCancelled: Self = Self(84);
     pub const InvalidUnlockTime: Self = Self(85);
+    pub const DuplicateSigners: Self = Self(86);
 }
 
 impl From<Error> for soroban_sdk::Error {
