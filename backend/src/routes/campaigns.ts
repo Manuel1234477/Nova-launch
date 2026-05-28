@@ -104,6 +104,25 @@ router.get("/:campaignId", validateCampaignIdParam, async (req, res) => {
   }
 });
 
+/** @contract CampaignAuditTrailResponse */
+router.get("/:campaignId/audit-trail", async (req, res) => {
+  try {
+    const campaignId = req.params.campaignId;
+    const limit = parseInt(req.query.limit as string) || 50;
+    const offset = parseInt(req.query.offset as string) || 0;
+
+    const result = await campaignProjectionService.getAuditTrail(
+      campaignId,
+      limit,
+      offset
+    );
+
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch audit trail" });
+  }
+});
+
 /**
  * POST /api/campaigns
  * Create a new campaign. Validated by validateCampaignCreate middleware.
