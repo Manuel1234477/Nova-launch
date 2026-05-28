@@ -285,6 +285,36 @@ pub fn emit_clawback_toggled(env: &Env, token_address: &Address, admin: &Address
     );
 }
 
+/// Emit clawback audit event (v1) - #1149
+///
+/// **Schema Version**: 1
+/// **Event Name**: clawb_au_v1
+///
+/// **Topics** (indexed):
+/// - Event name: "clawb_au_v1"
+/// - token_address: Address - The token contract address
+///
+/// **Payload** (non-indexed):
+/// - actor: Address - The admin who performed the clawback
+/// - target: Address - The address whose tokens were clawed back
+/// - amount: i128 - The amount of tokens clawed back
+///
+/// **Schema Stability**: This schema is immutable. Any changes require a new version.
+///
+/// Emitted when admin performs a clawback operation with full audit trail
+pub fn emit_clawback_audit(
+    env: &Env,
+    token_address: &Address,
+    actor: &Address,
+    target: &Address,
+    amount: i128,
+) {
+    env.events().publish(
+        (symbol_short!("clawb_au_v1"), token_address.clone()),
+        (actor.clone(), target.clone(), amount),
+    );
+}
+
 /// Emit token burned event (v1)
 ///
 /// **Schema Version**: 1

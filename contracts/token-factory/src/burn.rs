@@ -106,6 +106,13 @@ pub fn admin_burn(
     let _ = crate::snapshot::record_supply_snapshot(env, token_index, new_supply);
 
     emit_admin_burn_event(env, token_index, &admin, &holder, amount, new_supply);
+
+    // Emit dedicated clawback audit event for indexers (#1149)
+    // Event fires before/with state change, not after revert
+    if let Some(token_info) = storage::get_token_info(env, token_index) {
+        crate::events::emit_clawback_audit(env, &token_info.address, &admin, &holder, amount);
+    }
+
     Ok(())
 }
 

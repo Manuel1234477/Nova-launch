@@ -613,6 +613,11 @@ pub enum DataKey {
     ProposalTemplateCount,
     // Contract upgrade
     ContractVersion,
+    StorageVersion,
+    // Dividend distribution (#1148)
+    DividendDust(u32),
+    DividendRecord(u64),
+    DividendDistributionCount,
     // Dynamic quorum
     DynamicQuorumConfig,
     ParticipationRecord(u64), // keyed by proposal_id
@@ -893,6 +898,14 @@ impl Error {
     // Burn schedule errors
     pub const BurnScheduleNotFound: Self = Self(81);
     pub const BurnScheduleLocked: Self = Self(82);
+    // Storage migration errors (#1147)
+    pub const StorageMigrationAlreadyRun: Self = Self(83);
+    pub const StorageMigrationNotRequired: Self = Self(84);
+    // Dividend distribution errors (#1148)
+    pub const DividendDistributionFailed: Self = Self(85);
+    pub const DividendZeroHolders: Self = Self(86);
+    pub const DividendOverflow: Self = Self(87);
+    pub const DividendExceedsPool: Self = Self(88);
     pub const BurnScheduleAlreadyExecuted: Self = Self(83);
     pub const BurnScheduleCancelled: Self = Self(84);
     pub const InvalidUnlockTime: Self = Self(85);

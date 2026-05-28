@@ -38,6 +38,8 @@ mod payload_validation;
 mod proposal_queue;
 mod proposal_state_machine;
 mod storage;
+mod storage_migration;
+mod dividend_distribution;
 #[cfg(feature = "legacy-tests")]
 mod staking;
 mod streaming;
